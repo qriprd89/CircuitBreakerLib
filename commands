@@ -1,0 +1,14 @@
+virtualenv circuitBenv
+circuitBenv\scripts\activate
+set SERVICE_PATH=D:\SERVICES\API-Gateway
+pip install git+https://github.com/achalbante/CircuitBreakerLib.git
+
+
+
+=====================
+
+https://hackernoon.com/circuit-breakers-in-microservices-els3tv1
+
+
+____________________________
+pip install PyYAML
