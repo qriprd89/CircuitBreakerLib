@@ -1,11 +1,13 @@
 import time
 import threading
 import asyncio
-from enum import Enum
-from collections import deque
-from typing import Callable, Optional, Any, Deque
 import os
 import yaml
+import logging
+import concurrent.futures
+from enum import Enum
+from collections import deque
+from typing import Callable, Optional, Any, Dict
 
 
 # ----------------
@@ -21,41 +23,48 @@ class CircuitOpenError(Exception):
     pass
 
 
-# ----------------
-# CircuitBreaker class
-# ----------------
 class CircuitBreaker:
-    def __init__(self, fallback: Optional[Callable[..., Any]] = None):
-        """
-        Initialize a circuit breaker manager.
-        Config is loaded dynamically from CircuitBreaker.yaml
-        """
-        service_path = os.getenv("SERVICE_PATH", ".")
-        self.config_path = os.path.join(service_path, "CircuitBreaker.yaml")
-        self._fallback = fallback
-
-        # State storage per service
-        self._services = {}
-        self._lock = threading.RLock()
-        self._async_lock = asyncio.Lock()
+    def __init__(
+        self,
+        on_state_change: Optional[Callable[[str, State, State, dict], None]] = None,
+        on_event: Optional[Callable[[str, str, dict], None]] = None,
+        config_file: str = "CircuitBreaker.yaml",
+    ):
+        self._services: Dict[str, dict] = {}
+        self._locks: Dict[str, threading.RLock] = {}
+        self._async_locks: Dict[str, asyncio.Lock] = {}
+        self._on_state_change = on_state_change
+        self._on_event = on_event
+        self.config_file = os.path.join(os.getenv("SERVICE_PATH", "."), config_file)
+        self._cfg_cache = {}
+        self._cfg_mtime = None
+        self._log = logging.getLogger("CircuitBreaker")
 
     # ----------------
-    # Load config dynamically from YAML
+    # Load config dynamically
     # ----------------
     def _load_config(self, service: str):
-        with open(self.config_path, "r") as f:
-            full_config = yaml.safe_load(f) or {}
-        cb_config = full_config.get("circuit_breakers", {}).get(service, {})
+        try:
+            mtime = os.path.getmtime(self.config_file)
+            if self._cfg_mtime != mtime:
+                with open(self.config_file, "r") as f:
+                    full_config = yaml.safe_load(f) or {}
+                self._cfg_cache = full_config.get("circuit_breakers", {})
+                self._cfg_mtime = mtime
+        except FileNotFoundError:
+            self._cfg_cache = {}
 
+        cb_config = self._cfg_cache.get(service, {})
         return {
             "failure_threshold": cb_config.get("failure_threshold", 5),
             "recovery_timeout": cb_config.get("recovery_timeout", 30),
             "window_seconds": cb_config.get("window_seconds", 60),
             "half_open_max_calls": cb_config.get("half_open_max_calls", 1),
+            "response_timeout": cb_config.get("response_timeout", None),  # NEW
         }
 
     # ----------------
-    # Get or init service state
+    # Get/init service state
     # ----------------
     def _get_state(self, service: str):
         if service not in self._services:
@@ -68,24 +77,29 @@ class CircuitBreaker:
         return self._services[service]
 
     # ----------------
-    # Remove old failures
+    # State transitions
     # ----------------
+    def _set_state(self, service: str, new_state: State, ctx: dict):
+        state = self._get_state(service)
+        old = state["state"]
+        if old != new_state:
+            state["state"] = new_state
+            if self._on_state_change:
+                self._on_state_change(service, old, new_state, ctx)
+
     def _prune_failures(self, service: str, cfg: dict):
         now = time.time()
         state = self._get_state(service)
         while state["fail_times"] and state["fail_times"][0] < now - cfg["window_seconds"]:
             state["fail_times"].popleft()
 
-    # ----------------
-    # Check state before call
-    # ----------------
     def _check_state(self, service: str, cfg: dict):
         state = self._get_state(service)
         now = time.time()
 
         if state["state"] == State.OPEN and state["opened_at"] is not None:
             if now - state["opened_at"] >= cfg["recovery_timeout"]:
-                state["state"] = State.HALF_OPEN
+                self._set_state(service, State.HALF_OPEN, {"ts": now})
                 state["half_open_inflight"] = 0
 
         if state["state"] == State.HALF_OPEN:
@@ -93,11 +107,8 @@ class CircuitBreaker:
                 raise CircuitOpenError(f"Circuit '{service}' is HALF_OPEN. Max probe reached.")
 
         if state["state"] == State.OPEN:
-            raise CircuitOpenError(f"Circuit '{service}' is OPEN. Retry after {cfg['recovery_timeout']}s")
+            raise CircuitOpenError(f"Circuit '{service}' is OPEN. Retry later")
 
-    # ----------------
-    # Record failure
-    # ----------------
     def _record_failure(self, service: str, cfg: dict):
         state = self._get_state(service)
         now = time.time()
@@ -105,77 +116,93 @@ class CircuitBreaker:
         self._prune_failures(service, cfg)
 
         if state["state"] == State.HALF_OPEN or len(state["fail_times"]) >= cfg["failure_threshold"]:
-            state["state"] = State.OPEN
             state["opened_at"] = now
+            self._set_state(service, State.OPEN, {"ts": now})
 
-    # ----------------
-    # Record success
-    # ----------------
-    def _record_success(self, service: str):
+    def _record_success(self, service: str, cfg: dict):
         state = self._get_state(service)
         if state["state"] in [State.OPEN, State.HALF_OPEN]:
-            state["state"] = State.CLOSED
+            self._set_state(service, State.CLOSED, {"ts": time.time()})
             state["fail_times"].clear()
             state["half_open_inflight"] = 0
 
     # ----------------
     # Sync decorator
     # ----------------
-    def __call__(self, service: str):
+    def __call__(self, service: str, fallback: Optional[Callable[..., Any]] = None):
         def decorator(func: Callable):
             def wrapper(*args, **kwargs):
                 cfg = self._load_config(service)
-                with self._lock:
+                lock = self._locks.setdefault(service, threading.RLock())
+                with lock:
                     self._check_state(service, cfg)
                     state = self._get_state(service)
                     if state["state"] == State.HALF_OPEN:
                         state["half_open_inflight"] += 1
 
                 try:
-                    result = func(*args, **kwargs)
-                except Exception:
-                    with self._lock:
-                        self._record_failure(service, cfg)
-                    if self._fallback:
-                        return self._fallback(*args, **kwargs)
-                    raise
-                else:
-                    with self._lock:
-                        self._record_success(service)
+                    if cfg["response_timeout"]:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                            future = executor.submit(func, *args, **kwargs)
+                            result = future.result(timeout=cfg["response_timeout"])
+                    else:
+                        result = func(*args, **kwargs)
+
+                    with lock:
+                        self._record_success(service, cfg)
                     return result
+                except Exception:
+                    with lock:
+                        self._record_failure(service, cfg)
+                    if fallback:
+                        return fallback(*args, **kwargs)
+                    raise
+                finally:
+                    with lock:
+                        state = self._get_state(service)
+                        if state["state"] == State.HALF_OPEN and state["half_open_inflight"] > 0:
+                            state["half_open_inflight"] -= 1
             return wrapper
         return decorator
 
     # ----------------
     # Async decorator
     # ----------------
-    def async_wrap(self, service: str):
+    def async_wrap(self, service: str, fallback: Optional[Callable[..., Any]] = None):
         def decorator(func: Callable):
             async def wrapper(*args, **kwargs):
                 cfg = self._load_config(service)
-                async with self._async_lock:
+                alock = self._async_locks.setdefault(service, asyncio.Lock())
+                async with alock:
                     self._check_state(service, cfg)
                     state = self._get_state(service)
                     if state["state"] == State.HALF_OPEN:
                         state["half_open_inflight"] += 1
                 try:
-                    result = await func(*args, **kwargs)
-                except Exception:
-                    async with self._async_lock:
-                        self._record_failure(service, cfg)
-                    if self._fallback:
-                        return await self._fallback(*args, **kwargs)
-                    raise
-                else:
-                    async with self._async_lock:
-                        self._record_success(service)
+                    if cfg["response_timeout"]:
+                        result = await asyncio.wait_for(func(*args, **kwargs), timeout=cfg["response_timeout"])
+                    else:
+                        result = await func(*args, **kwargs)
+
+                    async with alock:
+                        self._record_success(service, cfg)
                     return result
+                except Exception:
+                    async with alock:
+                        self._record_failure(service, cfg)
+                    if fallback:
+                        return fallback(*args, **kwargs)
+                    raise
+                finally:
+                    async with alock:
+                        state = self._get_state(service)
+                        if state["state"] == State.HALF_OPEN and state["half_open_inflight"] > 0:
+                            state["half_open_inflight"] -= 1
             return wrapper
         return decorator
 
     # ----------------
-    # Utility: Get current state
+    # Utility
     # ----------------
     def status(self, service: str) -> str:
-        state = self._get_state(service)
-        return state["state"].value
+        return self._get_state(service)["state"].value
