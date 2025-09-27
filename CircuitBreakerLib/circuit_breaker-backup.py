@@ -43,101 +43,100 @@ class CircuitBreaker:
     # ----------------
     # Load config dynamically
     # ----------------
-    def _load_config(self, project: str, service: str):
+    def _load_config(self, service: str):
         try:
             mtime = os.path.getmtime(self.config_file)
             if self._cfg_mtime != mtime:
                 with open(self.config_file, "r") as f:
                     full_config = yaml.safe_load(f) or {}
-                self._cfg_cache = full_config
+                self._cfg_cache = full_config.get("circuit_breakers", {})
                 self._cfg_mtime = mtime
         except FileNotFoundError:
             self._cfg_cache = {}
 
-        cb_config = self._cfg_cache.get(project, {}).get(service, {})
+        cb_config = self._cfg_cache.get(service, {})
         return {
             "failure_threshold": cb_config.get("failure_threshold", 5),
             "recovery_timeout": cb_config.get("recovery_timeout", 30),
             "window_seconds": cb_config.get("window_seconds", 60),
             "half_open_max_calls": cb_config.get("half_open_max_calls", 1),
-            "response_timeout": cb_config.get("response_timeout", None),
+            "response_timeout": cb_config.get("response_timeout", None),  # NEW
         }
 
     # ----------------
     # Get/init service state
     # ----------------
-    def _get_state(self, key: str):
-        if key not in self._services:
-            self._services[key] = {
+    def _get_state(self, service: str):
+        if service not in self._services:
+            self._services[service] = {
                 "state": State.CLOSED,
                 "fail_times": deque(),
                 "half_open_inflight": 0,
                 "opened_at": None,
             }
-        return self._services[key]
+        return self._services[service]
 
     # ----------------
     # State transitions
     # ----------------
-    def _set_state(self, key: str, new_state: State, ctx: dict):
-        state = self._get_state(key)
+    def _set_state(self, service: str, new_state: State, ctx: dict):
+        state = self._get_state(service)
         old = state["state"]
         if old != new_state:
             state["state"] = new_state
             if self._on_state_change:
-                self._on_state_change(key, old, new_state, ctx)
+                self._on_state_change(service, old, new_state, ctx)
 
-    def _prune_failures(self, key: str, cfg: dict):
+    def _prune_failures(self, service: str, cfg: dict):
         now = time.time()
-        state = self._get_state(key)
+        state = self._get_state(service)
         while state["fail_times"] and state["fail_times"][0] < now - cfg["window_seconds"]:
             state["fail_times"].popleft()
 
-    def _check_state(self, key: str, cfg: dict):
-        state = self._get_state(key)
+    def _check_state(self, service: str, cfg: dict):
+        state = self._get_state(service)
         now = time.time()
 
         if state["state"] == State.OPEN and state["opened_at"] is not None:
             if now - state["opened_at"] >= cfg["recovery_timeout"]:
-                self._set_state(key, State.HALF_OPEN, {"ts": now})
+                self._set_state(service, State.HALF_OPEN, {"ts": now})
                 state["half_open_inflight"] = 0
 
         if state["state"] == State.HALF_OPEN:
             if state["half_open_inflight"] >= cfg["half_open_max_calls"]:
-                raise CircuitOpenError(f"Circuit '{key}' is HALF_OPEN. Max probe reached.")
+                raise CircuitOpenError(f"Circuit '{service}' is HALF_OPEN. Max probe reached.")
 
         if state["state"] == State.OPEN:
-            raise CircuitOpenError(f"Circuit '{key}' is OPEN. Retry later")
+            raise CircuitOpenError(f"Circuit '{service}' is OPEN. Retry later")
 
-    def _record_failure(self, key: str, cfg: dict):
-        state = self._get_state(key)
+    def _record_failure(self, service: str, cfg: dict):
+        state = self._get_state(service)
         now = time.time()
         state["fail_times"].append(now)
-        self._prune_failures(key, cfg)
+        self._prune_failures(service, cfg)
 
         if state["state"] == State.HALF_OPEN or len(state["fail_times"]) >= cfg["failure_threshold"]:
             state["opened_at"] = now
-            self._set_state(key, State.OPEN, {"ts": now})
+            self._set_state(service, State.OPEN, {"ts": now})
 
-    def _record_success(self, key: str, cfg: dict):
-        state = self._get_state(key)
+    def _record_success(self, service: str, cfg: dict):
+        state = self._get_state(service)
         if state["state"] in [State.OPEN, State.HALF_OPEN]:
-            self._set_state(key, State.CLOSED, {"ts": time.time()})
+            self._set_state(service, State.CLOSED, {"ts": time.time()})
             state["fail_times"].clear()
             state["half_open_inflight"] = 0
 
     # ----------------
     # Sync decorator
     # ----------------
-    def __call__(self, project: str, service: str, fallback: Optional[Callable[..., Any]] = None):
+    def __call__(self, service: str, fallback: Optional[Callable[..., Any]] = None):
         def decorator(func: Callable):
             def wrapper(*args, **kwargs):
-                cfg = self._load_config(project, service)
-                key = f"{project}:{service}"
-                lock = self._locks.setdefault(key, threading.RLock())
+                cfg = self._load_config(service)
+                lock = self._locks.setdefault(service, threading.RLock())
                 with lock:
-                    self._check_state(key, cfg)
-                    state = self._get_state(key)
+                    self._check_state(service, cfg)
+                    state = self._get_state(service)
                     if state["state"] == State.HALF_OPEN:
                         state["half_open_inflight"] += 1
 
@@ -150,17 +149,17 @@ class CircuitBreaker:
                         result = func(*args, **kwargs)
 
                     with lock:
-                        self._record_success(key, cfg)
+                        self._record_success(service, cfg)
                     return result
                 except Exception:
                     with lock:
-                        self._record_failure(key, cfg)
+                        self._record_failure(service, cfg)
                     if fallback:
                         return fallback(*args, **kwargs)
                     raise
                 finally:
                     with lock:
-                        state = self._get_state(key)
+                        state = self._get_state(service)
                         if state["state"] == State.HALF_OPEN and state["half_open_inflight"] > 0:
                             state["half_open_inflight"] -= 1
             return wrapper
@@ -169,15 +168,14 @@ class CircuitBreaker:
     # ----------------
     # Async decorator
     # ----------------
-    def async_wrap(self, project: str, service: str, fallback: Optional[Callable[..., Any]] = None):
+    def async_wrap(self, service: str, fallback: Optional[Callable[..., Any]] = None):
         def decorator(func: Callable):
             async def wrapper(*args, **kwargs):
-                cfg = self._load_config(project, service)
-                key = f"{project}:{service}"
-                alock = self._async_locks.setdefault(key, asyncio.Lock())
+                cfg = self._load_config(service)
+                alock = self._async_locks.setdefault(service, asyncio.Lock())
                 async with alock:
-                    self._check_state(key, cfg)
-                    state = self._get_state(key)
+                    self._check_state(service, cfg)
+                    state = self._get_state(service)
                     if state["state"] == State.HALF_OPEN:
                         state["half_open_inflight"] += 1
                 try:
@@ -187,17 +185,17 @@ class CircuitBreaker:
                         result = await func(*args, **kwargs)
 
                     async with alock:
-                        self._record_success(key, cfg)
+                        self._record_success(service, cfg)
                     return result
                 except Exception:
                     async with alock:
-                        self._record_failure(key, cfg)
+                        self._record_failure(service, cfg)
                     if fallback:
                         return fallback(*args, **kwargs)
                     raise
                 finally:
                     async with alock:
-                        state = self._get_state(key)
+                        state = self._get_state(service)
                         if state["state"] == State.HALF_OPEN and state["half_open_inflight"] > 0:
                             state["half_open_inflight"] -= 1
             return wrapper
@@ -206,6 +204,5 @@ class CircuitBreaker:
     # ----------------
     # Utility
     # ----------------
-    def status(self, project: str, service: str) -> str:
-        key = f"{project}:{service}"
-        return self._get_state(key)["state"].value
+    def status(self, service: str) -> str:
+        return self._get_state(service)["state"].value

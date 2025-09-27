@@ -1,48 +1,91 @@
-import random
+import asyncio
 import time
 from CircuitBreakerLib.circuit_breaker import CircuitBreaker, CircuitOpenError
 
-breaker = CircuitBreaker()
+# ---------------------------
+# Initialize Circuit Breaker
+# ---------------------------
+cb = CircuitBreaker()
+PROJECT = "Analytika"
+SERVICE = "AuthUserService"
 
-@breaker("name_service")
-def call_name_service():
-    print("calling name_service...")
-    raise RuntimeError("Fail!")   # trigger failure
+# ---------------------------
+# Simulated sync API call
+# ---------------------------
+@cb(PROJECT, SERVICE)
+def call_auth_sync(should_fail=False):
+    """Simulated sync call: fails if should_fail=True"""
+    if should_fail:
+        raise Exception("Simulated failure")
+    return {"status": "ok_sync"}
 
-@breaker("auth_service")
-def call_auth_service():
-    print("auth_service works!")
-    return "AUTH OK"
+# ---------------------------
+# Simulated async API call
+# ---------------------------
+@cb.async_wrap(PROJECT, SERVICE)
+async def call_auth_async(should_fail=False):
+    """Simulated async call: fails if should_fail=True"""
+    if should_fail:
+        raise Exception("Simulated failure")
+    await asyncio.sleep(0.1)
+    return {"status": "ok_async"}
 
+# ---------------------------
+# Test sync breaker
+# ---------------------------
+def test_sync():
+    print("\n=== SYNC TEST ===")
+    # First 3 calls fail to open the circuit
+    for i in range(3):
+        try:
+            res = call_auth_sync(should_fail=True)
+            print(f"[SYNC] call {i+1} ✅ result:", res)
+        except Exception as e:
+            print(f"[SYNC] call {i+1} ❌ FAILED:", e)
 
-@breaker.async_wrap("client_service")
-async def call_client_service():
-    print("client service down...")
-    raise RuntimeError("Boom")
+    # Next 3 calls should trigger circuit open
+    for i in range(3, 6):
+        try:
+            res = call_auth_sync()
+            print(f"[SYNC] call {i+1} ✅ result:", res)
+        except CircuitOpenError as e:
+            print(f"[SYNC] call {i+1} ⛔ BLOCKED:", e)
+        except Exception as e:
+            print(f"[SYNC] call {i+1} ❌ FAILED:", e)
 
-# ----------------
-# Run sync
-# ----------------
-try:
-    for _ in range(3):
-        call_name_service()
-except Exception as e:
-    print("name_service breaker:", e)
+    print("Final breaker state:", cb.status(PROJECT, SERVICE))
 
-print("auth result:", call_auth_service())
-print("name_service state:", breaker.status("name_service"))
+# ---------------------------
+# Test async breaker
+# ---------------------------
+async def test_async():
+    print("\n=== ASYNC TEST ===")
+    # First 3 calls fail to open the circuit
+    for i in range(3):
+        try:
+            res = await call_auth_async(should_fail=True)
+            print(f"[ASYNC] call {i+1} ✅ result:", res)
+        except Exception as e:
+            print(f"[ASYNC] call {i+1} ❌ FAILED:", e)
 
-# ----------------
-# Run async
-# ----------------
-import asyncio
-async def run():
-    try:
-        for _ in range(3):
-            await call_client_service()
-    except Exception as e:
-        print("client_service breaker:", e)
+    # Next 3 calls should trigger circuit open
+    for i in range(3, 6):
+        try:
+            res = await call_auth_async()
+            print(f"[ASYNC] call {i+1} ✅ result:", res)
+        except CircuitOpenError as e:
+            print(f"[ASYNC] call {i+1} ⛔ BLOCKED:", e)
+        except Exception as e:
+            print(f"[ASYNC] call {i+1} ❌ FAILED:", e)
 
-    print("client_service state:", breaker.status("client_service"))
+    print("Final breaker state:", cb.status(PROJECT, SERVICE))
 
-asyncio.run(run())
+# ---------------------------
+# Main
+# ---------------------------
+if __name__ == "__main__":
+    # Run sync test
+    test_sync()
+
+    # Run async test
+    asyncio.run(test_async())

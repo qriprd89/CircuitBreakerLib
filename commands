@@ -1,14 +1,45 @@
 virtualenv circuitBenv
+---------------------
 circuitBenv\scripts\activate
 set SERVICE_PATH=D:\SERVICES\API-Gateway
+--------------
 pip install git+https://github.com/achalbante/CircuitBreakerLib.git
 
 
 
-=====================
-
+==============documents=======
+https://bhaveshpraveen.medium.com/implementing-circuit-breaker-pattern-from-scratch-in-python-714100cdf90b
 https://hackernoon.com/circuit-breakers-in-microservices-els3tv1
+========================================================================================================
 
+States:
+
+Closed: 
+    Normal state. Requests pass through as usual. Failures are counted.
+
+Open: 
+    Too many failures occurred. Requests are blocked immediately, preventing further load on the failing service.
+
+Half-Open: 
+    After a cooldown period, a limited number of trial requests are allowed.
+
+    If they succeed → circuit goes back to Closed.
+
+    If they fail → circuit goes back to Open.
+
+Failure Threshold:
+    Defines how many failures within a certain time window will cause the breaker to open.
+
+Reset Timeout:
+    How long the breaker stays open before moving to half-open and allowing test requests.
+-------------------------------------------------------------
+Imagine your service calls a payment gateway API:
+
+If the auth-service is down and every request fails, your app would keep retrying and eventually crash or slow down.
+With a circuit breaker:
+After, say, 5 failures in 30 seconds, the breaker opens.
+Your app immediately fails requests (fast failure) instead of waiting on timeouts.
+After a minute, it tries a few requests in half-open state. If they succeed → resume normal operation.
 
 ____________________________
 pip install PyYAML
