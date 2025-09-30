@@ -43,3 +43,71 @@ After a minute, it tries a few requests in half-open state. If they succeed → 
 
 ____________________________
 pip install PyYAML
+
+
+
+
+1. failure_threshold: 3
+
+If 3 failures happen within the last 30 seconds (window_seconds), the circuit moves to OPEN.
+
+2. recovery_timeout: 10
+
+Once the circuit is OPEN, it stays OPEN (all calls blocked) for 10 seconds.
+
+After 10 seconds, it transitions to HALF_OPEN.
+
+3. half_open_max_calls: 1
+
+In HALF_OPEN, only 1 trial call is allowed.
+
+If that succeeds → circuit goes back to CLOSED (normal state).
+
+If that fails → circuit goes back to OPEN again.
+
+4. window_seconds: 30
+
+This is not a nap time.
+It’s the look-back window for counting failures.
+
+Example:
+
+Call fails at t=0s
+
+Call fails at t=10s
+
+Call fails at t=20s → That’s 3 failures within 30s → circuit goes OPEN.
+
+At t=40s, the first failure (at t=0) is expired from the sliding window. So now only the failures at t=10s and t=20s count.
+
+==============================================================================
+
+API Call → Check Service Port
+    if port down → force OPEN all APIs → raise CircuitOpenError-> take recovery_timeout after check ->half_open_max_calls
+    if port up → proceed
+
+API Call → Check API-level circuit
+    if port run → the check api working or not 
+    if API OPEN & recovery_timeout not passed → raise CircuitOpenError
+    if API OPEN & recovery_timeout passed → HALF_OPEN → allow probe
+    if API CLOSED → proceed
+
+
+Port down → all APIs blocked until recovery_timeout.
+
+Port up → working APIs proceed.
+
+API failures → open only that API, others unaffected.
+
+HALF_OPEN allows limited retries.
+
+=======================
+Service port check happens first, all APIs under the service OPEN if port is down.
+
+API-level failures affect only that API, other APIs remain functional.
+
+HALF_OPEN allows limited probes after recovery_timeout.
+
+Working APIs continue to run, even if another API is OPEN.
+
+Recovery timeout applies separately per API.

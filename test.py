@@ -8,11 +8,12 @@ from CircuitBreakerLib.circuit_breaker import CircuitBreaker, CircuitOpenError
 cb = CircuitBreaker()
 PROJECT = "Analytika"
 SERVICE = "AuthUserService"
+SERVICE_API = "call_auth_sync"
 
 # ---------------------------
 # Simulated sync API call
 # ---------------------------
-@cb(PROJECT, SERVICE)
+@cb(PROJECT, SERVICE,SERVICE_API)
 def call_auth_sync(should_fail=False):
     """Simulated sync call: fails if should_fail=True"""
     if should_fail:
@@ -89,3 +90,47 @@ if __name__ == "__main__":
 
     # Run async test
     asyncio.run(test_async())
+
+# ===================================
+breaker = CircuitBreaker()
+
+@breaker("Analytika", "AuthUserService", "login")
+def login():
+    print("Calling API...")
+    raise Exception("Service failure")
+
+# First call → fails and opens circuit
+try:
+    login()
+except Exception as e:
+    print("First call failed:", e)
+
+# Second call → blocked immediately
+try:
+    login()
+except CircuitOpenError as e:
+    print("Second call blocked:", e)
+
+print("Circuit status:", breaker.status("Analytika", "AuthUserService", "login"))
+
+=========================
+breaker = CircuitBreaker()
+
+@breaker.async_wrap("Analytika", "AuthUserService", "login")
+async def async_login():
+    print("Calling async API...")
+    raise Exception("Service failure")
+
+async def main():
+    try:
+        await async_login()
+    except Exception as e:
+        print("First async call failed:", e)
+
+    try:
+        await async_login()
+    except CircuitOpenError as e:
+        print("Second async call blocked:", e)
+
+import asyncio
+asyncio.run(main())
