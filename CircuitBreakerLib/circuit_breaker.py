@@ -60,6 +60,7 @@ class CircuitBreaker:
             "service_port": cb_config.get("service_port", None),
             "local_host": cb_config.get("local_host", "localhost"),
             "docker_host": cb_config.get("docker_host", "host.docker.internal"),
+            "active": cb_config.get("active", True),
         }
 
     # Circuit keys & states
@@ -180,26 +181,28 @@ class CircuitBreaker:
         state = self._get_state(key)
         if state["state"] in [State.OPEN, State.HALF_OPEN]:
             self._set_state(key, State.CLOSED, {"ts": time.time()})
-
-    # Sync decorator
-    def __call__(self, project: str, service: str, api: str,fallback: Optional[Callable[..., Any]]=None):
+            
+    
+    def __call__(self, project: str, service: str, api: str, fallback: Optional[Callable[..., Any]] = None):
         def decorator(func: Callable):
             def wrapper(*args, **kwargs):
-                key = self._circuit_key(project, service, api)
                 cfg = self._load_config(project, service)
+
+                # ⚙️ Skip circuit breaker if not active
+                if not cfg.get("active", True):
+                    return func(*args, **kwargs)
+
+                key = self._circuit_key(project, service, api)
                 lock = self._locks.setdefault(key, threading.RLock())
 
                 with lock:
-                    # 1️⃣ Check service port
                     self._check_service_port(project, service, cfg)
-                    # 2️⃣ Check API-level circuit state
                     self._check_state(key, cfg)
                     state = self._get_state(key)
                     if state["state"] == State.HALF_OPEN:
                         state["half_open_inflight"] += 1
 
                 try:
-                    # Call wrapped function with optional timeout
                     if cfg["response_timeout"]:
                         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                             future = executor.submit(func, *args, **kwargs)
@@ -208,19 +211,17 @@ class CircuitBreaker:
                             except concurrent.futures.TimeoutError:
                                 with lock:
                                     self._record_failure(key, cfg)
-                                # 🔴 Raise proper timeout error
-                                # raise ResponseTimeoutError(project, service, api, cfg["response_timeout"])
-                                raise ResponseTimeoutError(f"Request timed out after {cfg['response_timeout']} seconds while waiting for a response.")
+                                raise ResponseTimeoutError(
+                                    f"Request timed out after {cfg['response_timeout']} seconds."
+                                )
                     else:
                         result = func(*args, **kwargs)
 
-                    # Record success
                     with lock:
                         self._record_success(key, cfg)
                     return result
 
                 except ResponseTimeoutError:
-                    # Already recorded failure above
                     if fallback:
                         return fallback(*args, **kwargs)
                     raise
@@ -239,8 +240,10 @@ class CircuitBreaker:
                             state["half_open_inflight"] -= 1
             return wrapper
         return decorator
-    
-    # def __call__(self, project: str, service: str, api: str, fallback: Optional[Callable[..., Any]] = None):
+
+
+    # # Sync decorator
+    # def __call__(self, project: str, service: str, api: str,fallback: Optional[Callable[..., Any]]=None):
     #     def decorator(func: Callable):
     #         def wrapper(*args, **kwargs):
     #             key = self._circuit_key(project, service, api)
@@ -257,29 +260,39 @@ class CircuitBreaker:
     #                     state["half_open_inflight"] += 1
 
     #             try:
-    #                 # Call the wrapped function with optional timeout
+    #                 # Call wrapped function with optional timeout
     #                 if cfg["response_timeout"]:
     #                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
     #                         future = executor.submit(func, *args, **kwargs)
-    #                         result = future.result(timeout=cfg["response_timeout"])
+    #                         try:
+    #                             result = future.result(timeout=cfg["response_timeout"])
+    #                         except concurrent.futures.TimeoutError:
+    #                             with lock:
+    #                                 self._record_failure(key, cfg)
+    #                             # 🔴 Raise proper timeout error
+    #                             # raise ResponseTimeoutError(project, service, api, cfg["response_timeout"])
+    #                             raise ResponseTimeoutError(f"Request timed out after {cfg['response_timeout']} seconds while waiting for a response.")
     #                 else:
     #                     result = func(*args, **kwargs)
 
-    #                 # Record API success
+    #                 # Record success
     #                 with lock:
     #                     self._record_success(key, cfg)
     #                 return result
 
-    #             except concurrent.futures.TimeoutError:
-    #                 with lock:
-    #                     self._record_failure(key, cfg)
+    #             except ResponseTimeoutError:
+    #                 # Already recorded failure above
+    #                 if fallback:
+    #                     return fallback(*args, **kwargs)
     #                 raise
+
     #             except Exception:
     #                 with lock:
     #                     self._record_failure(key, cfg)
     #                 if fallback:
     #                     return fallback(*args, **kwargs)
     #                 raise
+
     #             finally:
     #                 with lock:
     #                     state = self._get_state(key)
@@ -287,7 +300,8 @@ class CircuitBreaker:
     #                         state["half_open_inflight"] -= 1
     #         return wrapper
     #     return decorator
-
+    
+    
     # Utility
     def status(self, project: str, service: str, api: str) -> str:
         key = self._circuit_key(project, service, api)
